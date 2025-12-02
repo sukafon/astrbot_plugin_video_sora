@@ -1,9 +1,26 @@
 {
-  "authorization_list": {
-    "description": "authorization列表",
-    "type": "list",
-    "default": [],
-    "hint": "支持添加多个Token轮询使用。Token获取方式：登录 https://chatgpt.com 以后，进入 https://chatgpt.com/api/auth/session 复制 accessToken 字段的值填写进去即可，不要加 Bearer 前缀。"
+  "token_config": {
+    "description": "Token配置",
+    "type": "object",
+    "hint": "",
+    "items": {
+      "token_type": {
+        "description": "Token类型",
+        "type": "string",
+        "options": [
+          "SessionToken",
+          "AccessToken"
+        ],
+        "default": "SessionToken",
+        "hint": "SessionToken有效期通常为3个月，AccessToken有效期10天"
+      },
+      "token_list": {
+        "description": "Token列表",
+        "type": "list",
+        "default": [],
+        "hint": "Token获取方式：登录 https://chatgpt.com，打开 https://chatgpt.com/api/auth/session。可以在页面中看到 AccessToken。若要获取 SessionToken，需要按F12，点击 应用程序-Cookie 复制右表 __Secure-next-auth.session-token 项的值作为 SessionToken 填入"
+      }
+    }
   },
   "task_limit": {
     "description": "每个账号的并发限制",
@@ -42,11 +59,24 @@
     "default": "生成一个多镜头视频",
     "hint": ""
   },
-  "watermark_enabled": {
-    "description": "启用水印",
-    "type": "bool",
-    "default": false,
-    "hint": "是否在生成的视频中添加 Sora2 水印。"
+  "watermark_config": {
+    "description": "水印配置",
+    "type": "object",
+    "hint": "以下是应用于模型的配置参数，可用性可能随时发生变化。",
+    "items": {
+      "not_watermark": {
+        "description": "无水印",
+        "type": "bool",
+        "default": false,
+        "hint": "是否获取无水印视频。若开启，需要配置第三方解析地址。"
+      },
+      "get_not_watermark_url": {
+        "description": "第三方解析地址",
+        "type": "string",
+        "default": "",
+        "hint": "当前仅支持项目 https://github.com/tibbar213/sora-downloader"
+      }
+    }
   },
   "screen_mode": {
     "description": "默认视频方向",
@@ -69,7 +99,7 @@
     "description": "chatgpt_base_url",
     "type": "string",
     "default": "https://chatgpt.com",
-    "hint": "用于获取Sentinel token以绕过反爬限制。"
+    "hint": "用于获取Sentinel token以绕过反爬限制。也用于刷新AccessToken。"
   },
   "speed_down_url_type": {
     "description": "下载视频的反代类型",
@@ -109,6 +139,6 @@
     "description": "Proxy",
     "type": "string",
     "default": "",
-    "hint": "HTTP正向代理，格式可能是http://127.0.0.1:7890，填写后将应用于全部端点请求。如果同时填写正向代理和反向代理，可能会导致代理两次的情况。"
+    "hint": "HTTP正向代理，格式可能是http://127.0.0.1:7890，填写后将应用于Sora和Chatgpt全部端点请求。如果同时填写正向代理和反向代理，可能会导致代理两次的情况。"
   }
 }

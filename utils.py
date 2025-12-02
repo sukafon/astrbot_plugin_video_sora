@@ -1,15 +1,17 @@
-import time
 import asyncio
-import json
-import hashlib
 import base64
+import hashlib
+import json
 import os
-from PIL import Image
+import time
 from io import BytesIO
-from curl_cffi import requests, AsyncSession, CurlMime
-from curl_cffi.requests.exceptions import Timeout
-from astrbot.api import logger
 from uuid import uuid4
+
+from curl_cffi import AsyncSession, CurlMime, ProxySpec, requests
+from curl_cffi.requests.exceptions import Timeout
+from PIL import Image
+
+from astrbot.api import logger
 
 # 轮询参数
 MAX_INTERVAL = 90  # 最大间隔
@@ -25,16 +27,17 @@ class Utils:
         proxy: str,
         model_config: dict,
         video_data_dir: str,
-        watermark_enabled: bool,
+        get_not_watermark_url: str,
     ):
         self.sora_base_url = sora_base_url
         self.chatgpt_base_url = chatgpt_base_url
-        proxies = {"http": proxy, "https": proxy} if proxy else None
-        self.session = AsyncSession(impersonate="chrome136", proxies=proxies)
+        self.proxies: ProxySpec | None = (
+            {"http": proxy, "https": proxy} if proxy else None
+        )
+        self.session = AsyncSession(impersonate="chrome136")
         self.model_config = model_config
-        self.UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36 Edg/141.0.0.0"
         self.video_data_dir = video_data_dir
-        self.watermark_enabled = watermark_enabled
+        self.get_not_watermark_url = get_not_watermark_url
 
     def _handle_image(self, image_bytes: bytes) -> bytes:
         try:
@@ -45,7 +48,10 @@ class Utils:
                 # 处理 GIF
                 buf = BytesIO()
                 # 判断是否为动画 GIF（多帧）
-                if getattr(img, "is_animated", False) and img.n_frames > 1:
+                if (
+                    getattr(img, "is_animated", False)
+                    and getattr(img, "n_frames", 1) > 1
+                ):
                     img.seek(0)  # 只取第一帧
                 # 单帧 GIF 或者多帧 GIF 的第一帧都走下面的保存逻辑
                 img = img.convert("RGBA")
@@ -103,14 +109,17 @@ class Utils:
                 self.sora_base_url + "/backend/uploads",
                 multipart=mp,
                 headers={"Authorization": authorization},
+                proxies=self.proxies,
             )
+            result = response.json()
             if response.status_code == 200:
-                result = response.json()
                 return result.get("id"), None
             else:
-                result = response.json()
                 err_str = f"上传图片失败: {result.get('error', {}).get('message')}"
+                err_code = result.get("error", {}).get("code")
                 logger.error(err_str)
+                if err_code == "token_expired":
+                    return None, "token_expired"
                 return None, err_str
         except Timeout as e:
             logger.error(f"网络请求超时: {e}")
@@ -123,14 +132,16 @@ class Utils:
 
     async def get_sentinel(self) -> tuple[str | None, str | None]:
         # 随便生成一个哈希值作为PoW证明，反正服务器也不验证，留空都可以
-        id = str(uuid4())
-        random_str = (self.UA + id).encode()
-        stoken = base64.b64encode(hashlib.sha256(random_str).digest()).decode()
+        uuid = str(uuid4())
+        random_bytes = uuid.encode()
+        stoken = base64.b64encode(hashlib.sha256(random_bytes).digest()).decode()
         flow = "sora_2_create_task"
-        payload = {"flow": flow, "id": id, "p": stoken}
+        payload = {"flow": flow, "id": uuid, "p": stoken}
         try:
             response = await self.session.post(
-                self.chatgpt_base_url + "/backend-api/sentinel/req", json=payload
+                self.chatgpt_base_url + "/backend-api/sentinel/req",
+                json=payload,
+                proxies=self.proxies,
             )
             if response.status_code == 200:
                 result = response.json()
@@ -139,12 +150,12 @@ class Utils:
                     "p": stoken,
                     "t": result.get("turnstile", {}).get("dx", ""),
                     "c": result.get("token", ""),
-                    "id": id,
+                    "id": uuid,
                     "flow": flow,
                 }
                 return json.dumps(sentinel_token), None
             else:
-                logger.error(f"获取Sentinel tokens失败: {response.text}")
+                logger.error(f"获取Sentinel tokens失败: {response.text[:100]}")
                 return None, "获取Sentinel tokens失败"
         except Timeout as e:
             logger.error(f"网络请求超时: {e}")
@@ -186,14 +197,17 @@ class Utils:
                     "Authorization": authorization,
                     "openai-sentinel-token": sentinel_token,
                 },
+                proxies=self.proxies,
             )
+            result = response.json()
             if response.status_code == 200:
-                result = response.json()
                 return result.get("id"), None
             else:
-                result = response.json()
                 err_str = f"提交任务失败: {result.get('error', {}).get('message')}"
-                logger.error(f"{err_str}，Token: {authorization[-8:]}")
+                err_code = result.get("error", {}).get("code")
+                logger.error(f"{err_str}，Token: {authorization[-16:]}")
+                if err_code == "token_expired":
+                    return None, "token_expired"
                 return None, err_str
         except Timeout as e:
             logger.error(f"网络请求超时: {e}")
@@ -209,6 +223,7 @@ class Utils:
             response = await self.session.get(
                 self.sora_base_url + "/backend/nf/pending",
                 headers={"Authorization": authorization},
+                proxies=self.proxies,
             )
             if response.status_code == 200:
                 result = response.json()
@@ -289,6 +304,7 @@ class Utils:
             response = await self.session.get(
                 self.sora_base_url + "/backend/project_y/profile/drafts?limit=15",
                 headers={"Authorization": authorization},
+                proxies=self.proxies,
             )
             if response.status_code == 200:
                 result = response.json()
@@ -329,63 +345,12 @@ class Utils:
             logger.error(f"获取视频链接失败: {e}")
             return "EXCEPTION", None, None, "获取视频链接失败"
 
-    async def fetch_video_url(
-        self, task_id: str, authorization: str
-    ) -> tuple[str, str | None, str | None, str | None]:
-        try:
-            response = await self.session.get(
-                self.sora_base_url + "/backend/video_gen",
-                headers={"Authorization": authorization},
-            )
-            if response.status_code == 200:
-                result = response.json()
-                for item in result.get("task_responses", []):
-                    if item.get("id") == task_id:
-                        if not item.get("generations"):
-                            return (
-                                "Failed",
-                                None,
-                                None,
-                                item.get("failure_reason"),
-                            )
-                        video_url = (
-                            item.get("generations", [])[0]
-                            .get("encodings", {})
-                            .get(
-                                "source_wm" if self.watermark_enabled else "source", {}
-                            )
-                            .get("path")
-                        )
-                        return (
-                            "Done",
-                            video_url,
-                            item.get("generations", [])[0].get("id"),
-                            None,
-                        )
-                return "NotFound", None, None, "未找到对应的视频"
-            else:
-                result = response.json()
-                err_str = f"获取视频链接失败: {result.get('error', {}).get('message')}"
-                logger.error(err_str)
-                return "ServerError", None, None, err_str
-        except Timeout as e:
-            logger.error(f"网络请求超时: {e}")
-            return (
-                "Timeout",
-                None,
-                None,
-                "获取视频链接失败：网络请求超时，请检查网络连通性",
-            )
-        except Exception as e:
-            logger.error(f"获取视频链接失败: {e}")
-            return "EXCEPTION", None, None, "获取视频链接失败"
-
     async def download_video(
         self, video_url: str, task_id: str
     ) -> tuple[str | None, str | None]:
         try:
             logger.debug(f"正在下载视频: {video_url}")
-            response = await self.session.get(video_url)
+            response = await self.session.get(video_url, proxies=self.proxies)
             if response.status_code == 200:
                 # 保存视频内容到本地文件
                 video_path = os.path.join(self.video_data_dir, f"{task_id}.mp4")
@@ -418,12 +383,13 @@ class Utils:
             response = await self.session.get(
                 self.sora_base_url + "/backend/nf/pending",
                 headers={"Authorization": authorization},
+                proxies=self.proxies,
             )
             if response.status_code == 200:
                 return "Success"
             else:
                 result = response.json()
-                err_str = f"Token {authorization[-8:]} 无效: {result.get('error', {}).get('message')}"
+                err_str = f"Token {authorization[-16:]} 无效: {result.get('error', {}).get('message')}"
                 logger.error(err_str)
                 return "Invalid"
         except Timeout as e:
@@ -432,6 +398,107 @@ class Utils:
         except Exception as e:
             logger.error(f"程序错误: {e}")
             return "EXCEPTION"
+
+    async def refresh_access_token(
+        self, sessionToken: str
+    ) -> tuple[str | None, str | None, str | None]:
+        headers = {
+            "Origin": "https://sora.chatgpt.com",
+            "Referer": "https://sora.chatgpt.com/",
+            "Cookie": f"__Secure-next-auth.session-token={sessionToken}",
+        }
+        try:
+            response = await self.session.get(
+                self.chatgpt_base_url + "/api/auth/session",
+                headers=headers,
+                proxies=self.proxies,
+            )
+            result = response.json()
+            if response.status_code == 200:
+                access_token = result.get("accessToken")
+                expires = result.get("expires")
+                if access_token:
+                    return access_token, expires, None
+                else:
+                    logger.error("刷新AccessToken失败: 未获取到AccessToken")
+                    return None, None, "刷新AccessToken失败"
+            else:
+                err_str = (
+                    f"刷新AccessToken失败: {result.get('error', {}).get('message')}"
+                )
+                logger.error(err_str)
+                return None, None, err_str
+        except Timeout as e:
+            logger.error(f"网络请求超时: {e}")
+            return None, None, "刷新AccessToken失败：网络请求超时，请检查网络连通性"
+        except Exception as e:
+            logger.error(f"刷新AccessToken失败: {e}")
+            return None, None, "刷新AccessToken失败"
+
+    async def _post_video(
+        self, authorization: str, generation_id: str
+    ) -> tuple[str | None, str | None]:
+        headers = {
+            "Content-Type": "application/json",
+            "Origin": "https://sora.chatgpt.com",
+            "Referer": "https://sora.chatgpt.com/",
+            "Authorization": authorization,
+        }
+        payload = {
+            "attachments_to_create": [{"generation_id": generation_id, "kind": "sora"}],
+            "post_text": "",
+        }
+        try:
+            response = await self.session.post(
+                self.sora_base_url + "/backend/project_y/post",
+                headers=headers,
+                json=payload,
+                proxies=self.proxies,
+            )
+            result = response.json()
+            if response.status_code == 200:
+                permalink = result.get("post", {}).get("permalink")
+                if not permalink:
+                    logger.error("发布视频失败: 未获取到分享链接")
+                    return None, "发布视频失败: 未获取到分享链接"
+                return permalink, None
+            else:
+                err_str = f"发布视频失败: {result.get('error', {}).get('message')}"
+                logger.error(err_str)
+                return None, err_str
+        except Exception as e:
+            logger.error(f"发布视频失败: {e}")
+            return None, "发布视频失败"
+
+    async def get_not_watermark(
+        self, authorization: str, generation_id: str
+    ) -> tuple[str | None, str | None]:
+        permalink, err = await self._post_video(authorization, generation_id)
+        if err:
+            return None, err
+        payload = {
+            "url": permalink,
+            "token": None,
+        }
+        try:
+            response = await self.session.post(
+                self.get_not_watermark_url,
+                json=payload,
+            )
+            result = response.json()
+            if response.status_code == 200:
+                download_link = result.get("download_link")
+                if not download_link:
+                    logger.error("获取无水印视频失败: 未获取到无水印链接")
+                    return None, "获取无水印视频失败: 未获取到无水印链接"
+                return download_link, None
+            else:
+                err_str = f"获取无水印视频失败，状态码: {response.status_code}，响应: {response.text[:100]}"
+                logger.error(err_str)
+                return None, "获取无水印视频失败"
+        except Exception as e:
+            logger.error(f"获取无水印视频失败: {e}")
+            return None, "获取无水印视频失败"
 
     async def close(self):
         await self.session.close()
