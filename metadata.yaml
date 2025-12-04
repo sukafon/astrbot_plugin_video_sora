@@ -1,5 +1,6 @@
-name: 🫧Sora视频生成🫧 # 这是你的插件的唯一识别名。
-desc: 使用 OpenAI Sora 模型生成视频 # 插件简短描述
-version: v1.3.0 # 插件版本号。格式：v1.1.1 或者 v1.1
-author: Sukafon # 作者
-repo: https://github.com/sukafon/astrbot_plugin_video_sora # 插件的仓库地址
+name: astrbot_plugin_video_sora
+display_name: 🫧Sora视频生成🫧
+desc: 使用 OpenAI Sora 模型生成视频
+version: v1.3.1
+author: Sukafon
+repo: https://github.com/sukafon/astrbot_plugin_video_sora

@@ -28,6 +28,12 @@
     "default": 3,
     "hint": "一开始测试是2，最近测试是3，以后可能会变。"
   },
+  "llm_tool_enabled": {
+    "description": "启用函数调用工具",
+    "type": "bool",
+    "default": false,
+    "hint": "通过大语言模型调用函数工具生成视频，请在AstrBot面板的配置文件中将 工具调用超时时间 设置为600秒，否则生成时间不够。"
+  },
   "model_config": {
     "description": "模型配置",
     "type": "object",
@@ -62,7 +68,7 @@
   "watermark_config": {
     "description": "水印配置",
     "type": "object",
-    "hint": "以下是应用于模型的配置参数，可用性可能随时发生变化。",
+    "hint": "",
     "items": {
       "not_watermark": {
         "description": "无水印",

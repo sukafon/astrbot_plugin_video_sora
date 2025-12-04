@@ -6,7 +6,7 @@
 
 [![License](https://img.shields.io/badge/License-MIT-green.svg)](https://opensource.org/licenses/MIT)
 [![Python 3.10+](https://img.shields.io/badge/Python-3.10%2B-blue.svg)](https://www.python.org)
-[![AstrBot](https://img.shields.io/badge/AstrBot-4.0%2B-75B9D8.svg)](https://github.com/AstrBotDevs/AstrBot)
+[![AstrBot](https://img.shields.io/badge/AstrBot-4.5.1%2B-75B9D8.svg)](https://github.com/AstrBotDevs/AstrBot)
 [![Sora](https://img.shields.io/badge/OpenAI%20Sora-2-00aaff.svg)](https://sora.com)
 
 </div>
@@ -22,7 +22,7 @@
 
 1. 登录 https://chatgpt.com
 2. 打开 https://chatgpt.com/api/auth/session
-3. 按F12，点击 应用程序-Cookie，复制右表 __Secure-next-auth.session-token 项的值作为 SessionToken 填入，不需要加 `Bearer ` 前缀。
+3. 按F12，点击 应用程序-Cookie，复制右表 __Secure-next-auth.session-token 项的值作为 SessionToken 填入插件配置，不需要加 `Bearer ` 前缀。
 4. 打开 https://sora.com 检查账号是否有 Sora 模型的使用权限。注意是新版 Sora。
 
 ## Sora2 邀请码
@@ -100,4 +100,4 @@
 - 如果使用反向代理，请确保反向代理的来源可信，以保证账号安全。
 
 ## 注
-- 部分代码参考自 `https://github.com/tibbar213/sora-downloader`，感谢作者的开源代码！
+- 部分思路参考自 `https://github.com/tibbar213/sora-downloader`，感谢作者的开源！

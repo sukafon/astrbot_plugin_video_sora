@@ -2,8 +2,6 @@ import asyncio
 import os
 import random
 import re
-import sqlite3
-from datetime import datetime
 
 import astrbot.api.message_components as Comp
 from astrbot.api import logger
@@ -11,9 +9,11 @@ from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.message_components import Video
 from astrbot.api.star import Context, Star, StarTools
 from astrbot.core import AstrBotConfig
-from astrbot.core.message.message_event_result import MessageChain
+from astrbot.core.message.message_event_result import MessageChain, MessageEventResult
 
-from .utils import Utils
+from .database import Database
+from .sora_api import SoraAPI
+from .utils import get_image, get_screen_mode
 
 # 获取视频下载地址
 MAX_WAIT = 30  # 最大等待时间（秒）
@@ -41,8 +41,8 @@ class VideoSora(Star):
         self.video_data_dir = os.path.join(
             StarTools.get_data_dir("astrbot_plugin_video_sora"), "videos"
         )
-        # 把基本参数传递给工具类
-        self.utils = Utils(
+        # 实例化SoraAPI
+        self.SoraAPI = SoraAPI(
             sora_base_url,
             chatgpt_base_url,
             self.proxy,
@@ -59,8 +59,6 @@ class VideoSora(Star):
         token_config = self.config.get("token_config", {})
         self.token_type = token_config.get("token_type", "SessionToken")
         self.token_list = token_config.get("token_list", [])
-        # 创建一个鉴权错误或者过期的Token集合
-        self.token_err_set = set()
 
         # 并发限制
         self.polling_task = set()
@@ -70,74 +68,63 @@ class VideoSora(Star):
         self.group_whitelist_enabled = self.config.get("group_whitelist_enabled", False)
         self.group_whitelist = self.config.get("group_whitelist", [])
 
+        # 单线程锁
+        self.lock = asyncio.Lock()
+
     async def initialize(self):
         """可选择实现异步的插件初始化方法，当实例化该插件类之后会自动调用该方法。"""
         # 创建视频缓存文件路径
         os.makedirs(self.video_data_dir, exist_ok=True)
         # 数据库文件路径
-        video_db_path = os.path.join(
-            StarTools.get_data_dir("astrbot_plugin_video_sora"), "video_data.db"
+        video_db_path = (
+            StarTools.get_data_dir("astrbot_plugin_video_sora") / "video_data.db"
         )
-        # 打开持久化连接
-        self.conn = sqlite3.connect(video_db_path)
-        self.cursor = self.conn.cursor()
-        # 创建视频数据表（在video_data数据表中，auth_xor为AccessToken后16位）
-        self.cursor.execute("""
-            CREATE TABLE IF NOT EXISTS video_data (
-                task_id TEXT PRIMARY KEY NOT NULL,
-                user_id INTEGER,
-                nickname TEXT,
-                prompt TEXT,
-                image_url TEXT,
-                status TEXT,
-                video_url TEXT,
-                generation_id TEXT,
-                message_id INTEGER,
-                auth_xor TEXT,
-                error_msg TEXT,
-                updated_at DATETIME,
-                created_at DATETIME
-            )
-        """)
-        # 创建AccessToken数据表（在session_token数据表中，session_token为SessionToken后16位）
-        self.cursor.execute("""
-            CREATE TABLE IF NOT EXISTS session_token_table (
-                session_token_xor TEXT PRIMARY KEY NOT NULL,
-                access_token TEXT,
-                session_token_expire TEXT,
-                access_token_expire TEXT,
-                session_token_state INTEGER
-            )
-        """)
-        self.conn.commit()
+        # 实例化数据库类
+        self.database = Database(video_db_path)
 
-        if self.token_type == "SessionToken":
-            # 优化一下性能，为SessionToken建两个字典，便于查询
-            # 以后16位SessionToken作为key，完整的SessionToken作为value
-            self.session_token_dict = {k[-16:]: k for k in self.token_list}
-            # 从数据库中加载AccessToken
-            tokens = [k[-16:] for k in self.token_list]
-            placeholders = ",".join("?" * len(tokens))
-            self.cursor.execute(
-                "SELECT session_token_xor, access_token FROM session_token_table WHERE session_token_xor IN ("
-                + placeholders
-                + ")",
-                tokens,
-            )
-            rows = self.cursor.fetchall()
-            # 以后16位SessionToken作为key，AccessToken作为value。避免SessionToken太大影响查询性能
-            self.access_token_dict = {}
-            for session_token_xor, access_token in rows:
-                # 将数据库里的 token 映射填入字典
-                self.access_token_dict[session_token_xor] = access_token
+        # 构建一个以用户所填Token的后16位为key的字典，记录AccessToken和使用统计等信息
+        self.token_dict: dict[str, dict] = {}
+        # 初始化这个字典
+        for token in self.token_list:
+            token_key = token[-16:]
+            self.token_dict[token_key] = {
+                "session_token": token if self.token_type == "SessionToken" else None,
+                "access_token": token if self.token_type == "AccessToken" else None,
+                "used_count_today": 0,
+                "concurrency_count": 0,
+                "rate_limit_reached": False,
+                "token_state": 1,
+            }
 
-            # 记录并发使用情况
-            self.token_dict = {}
-            for session_token in self.token_list:
-                session_token_xor = session_token[-16:]
-                self.token_dict[session_token_xor] = 0
-        else:
-            self.token_dict = dict.fromkeys(self.token_list, 0)
+        # 从数据库中加载持久化数据
+        tokens = [k[-16:] for k in self.token_list]
+        rows = self.database.load_token_data(tokens)
+        for token_key, access_token, used_count_today, rate_limit_reached in rows:
+            # 如果数据库中有未配置或已被删除的 token，则跳过并记录日志，防止 KeyError
+            if token_key not in self.token_dict:
+                logger.warning(f"[sora插件初始化] {token_key} 未在配置中存在，已跳过")
+                continue
+            # 将数据库里的 access_token 映射填入字典
+            if self.token_type == "SessionToken":
+                self.token_dict[token_key]["access_token"] = access_token or None
+            self.token_dict[token_key]["used_count_today"] = used_count_today or 0
+            self.token_dict[token_key]["rate_limit_reached"] = bool(rate_limit_reached)
+
+        # 创建一个token_key列表，用于优化遍历性能
+        self.token_key_list = list(self.token_dict.keys())
+
+        # 检查配置是否已经关闭函数工具
+        if not self.config.get("llm_tool_enabled", False):
+            StarTools.unregister_llm_tool("sora_video_generation")
+            logger.info("已删除函数调用工具: sora_video_generation")
+
+    async def concurrence_lock(self, token_key: str, is_add: bool):
+        """一个确保计数安全的小锁"""
+        async with self.lock:
+            if is_add:
+                self.token_dict[token_key]["concurrency_count"] += 1
+            else:
+                self.token_dict[token_key]["concurrency_count"] -= 1
 
     async def queue_task(
         self,
@@ -150,14 +137,16 @@ class VideoSora(Star):
 
         # 检查是否已经有相同的任务在处理
         if task_id in self.polling_task:
-            status, _, progress = await self.utils.pending_video(task_id, authorization)
+            status, _, progress = await self.SoraAPI.pending_video(
+                task_id, authorization
+            )
             return (
                 None,
                 f"⏳ 任务还在队列中，请稍后再看~\n状态：{status} 进度: {progress * 100:.2f}%",
             )
         # 优化人机交互
         if is_check:
-            status, err, progress = await self.utils.pending_video(
+            status, err, progress = await self.SoraAPI.pending_video(
                 task_id, authorization
             )
             if err:
@@ -181,21 +170,10 @@ class VideoSora(Star):
             self.polling_task.add(task_id)
 
             # 等待视频生成
-            result, err = await self.utils.poll_pending_video(task_id, authorization)
+            result, err = await self.SoraAPI.poll_pending_video(task_id, authorization)
 
             # 更新任务进度
-            self.cursor.execute(
-                """
-                UPDATE video_data SET status = ?, error_msg = ?, updated_at = ? WHERE task_id = ?
-            """,
-                (
-                    result,
-                    err,
-                    datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                    task_id,
-                ),
-            )
-            self.conn.commit()
+            self.database.update_poll_finished_data(task_id, result, err)
 
             if result != "Done" or err:
                 return None, err
@@ -207,39 +185,35 @@ class VideoSora(Star):
             err = None
             # 获取视频下载地址
             while elapsed < MAX_WAIT:
-                # 降级查询，尝试通过web端点获取视频链接或者失败原因
+                # 通过web端点获取视频链接或者失败原因
                 (
                     status,
                     video_url,
                     generation_id,
                     err,
-                ) = await self.utils.get_video_by_web(task_id, authorization)
+                ) = await self.SoraAPI.get_video_by_web(task_id, authorization)
                 if video_url or status in {"Failed", "EXCEPTION"}:
                     break
                 await asyncio.sleep(INTERVAL)
                 elapsed += INTERVAL
 
-            # 更新任务进度
-            self.cursor.execute(
-                """
-                UPDATE video_data SET status = ?, video_url = ?, generation_id = ?, error_msg = ?, updated_at = ? WHERE task_id = ?
-            """,
-                (
-                    status,
-                    video_url,
-                    generation_id,
-                    err,
-                    datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                    task_id,
-                ),
-            )
-            self.conn.commit()
-
             # 获取无水印视频链接
-            if self.not_watermark and generation_id and self.get_not_watermark_url:
-                video_url, err = await self.utils.get_not_watermark(
+            if (
+                not err
+                and self.not_watermark
+                and generation_id
+                and self.get_not_watermark_url
+            ):
+                not_watermark_url, err = await self.SoraAPI.get_not_watermark(
                     authorization, generation_id
                 )
+                if not_watermark_url:
+                    video_url = not_watermark_url
+
+            # 更新视频链接数据
+            self.database.update_video_url_data(
+                task_id, status, video_url, generation_id, err
+            )
 
             # 把错误信息返回给调用者
             if not video_url:
@@ -258,170 +232,124 @@ class VideoSora(Star):
         prompt: str,
         screen_mode: str,
         authorization: str,
-        auth_token: str,
+        token_key: str,
     ) -> tuple[str | None, str | None]:
-        """创建视频生成任务"""
+        """创建视频生成任务流程"""
         # 如果消息中携带图片，上传图片到OpenAI端点
         images_id = ""
         if image_bytes:
-            images_id, err = await self.utils.upload_images(authorization, image_bytes)
+            images_id, err = await self.SoraAPI.upload_images(
+                authorization, image_bytes
+            )
             if not images_id or err:
                 return None, err
 
         # 生成视频
-        task_id, err = await self.utils.create_video(
+        task_id, err = await self.SoraAPI.create_video(
             prompt, screen_mode, images_id, authorization
         )
         if not task_id or err:
             return None, err
 
         # 记录任务数据
-        datetime_now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        self.cursor.execute(
-            """
-            INSERT INTO video_data (task_id, user_id, nickname, prompt, image_url, status, message_id, auth_xor, updated_at, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                task_id,
-                event.message_obj.sender.user_id,
-                event.message_obj.sender.nickname,
-                prompt,
-                image_url,
-                "Queued",
-                event.message_obj.message_id,
-                auth_token,  # 只存储auth_token的最后16位以作区分
-                datetime_now,
-                datetime_now,
-            ),
+        self.database.insert_video_data(
+            task_id,
+            event.message_obj.sender.user_id,
+            event.message_obj.sender.nickname,
+            prompt,
+            image_url,
+            event.message_obj.message_id,
+            token_key,
         )
-        self.conn.commit()
         # 返回结果
         return task_id, None
 
-    async def handle_video_comp(
-        self, task_id: str, video_url: str
-    ) -> tuple[Video | None, str | None]:
+    async def handle_video_chain(
+        self, event: AstrMessageEvent, task_id: str, video_url: str
+    ) -> tuple[MessageEventResult | None, str | None]:
         """处理视频组件消息"""
-        # 视频组件
-        video_comp = None
-        err_msg = None
 
         # 处理反向代理
         if self.speed_down_url_type == "拼接":
             video_url = self.speed_down_url + video_url
-        elif self.speed_down_url_type == "替换":
+        else:
             video_url = re.sub(r"^(https?://[^/]+)", self.speed_down_url, video_url)
-        # 默认直接上报视频URL
-        video_comp = Video.fromURL(video_url)
 
         # 下载视频到本地
         if self.proxy or self.save_video_enabled:
             video_path = os.path.join(self.video_data_dir, f"{task_id}.mp4")
-            # 先检查本地文件是否有视频文件
+            # 先检查文件路径是否有视频文件
             if not os.path.exists(video_path):
-                video_path, err_msg = await self.utils.download_video(
+                video_path, err_msg = await self.SoraAPI.download_video(
                     video_url, task_id
                 )
             # 如果设置了正向代理，则上报本地文件路径
             if self.proxy:
                 if err_msg:
                     return None, err_msg
-                video_comp = Video.fromFileSystem(video_path)
-        return video_comp, None
+                return event.chain_result([Video.fromFileSystem(video_path)]), None
+        return event.chain_result([Video.fromURL(video_url)]), None
 
-    @filter.command("sora", alias={"生成视频"})
-    async def video_sora(self, event: AstrMessageEvent):
-        """生成视频"""
+    async def check_permission(self, event: AstrMessageEvent) -> bool:
+        """检查插件使用权限"""
         # 检查群是否在白名单中
         if (
             self.group_whitelist_enabled
             and event.unified_msg_origin not in self.group_whitelist
         ):
             logger.warning("当前群不在白名单中，无法使用sora视频生成功能")
-            return
+            return False
 
         # 检查Token是否存在
         if not self.token_list:
-            yield event.chain_result(
-                [
-                    Comp.Reply(id=event.message_obj.message_id),
-                    Comp.Plain("❌ 请先在插件配置中添加 Token"),
-                ]
-            )
-            return
-
-        # 解析参数
-        msg = re.match(
-            r"^(?:生成视频|sora)(?:\s+(横屏|竖屏)?\s*([\s\S]*))?$",
-            event.message_str,
-        )
-        # 提取提示词
-        prompt = msg.group(2).strip() if msg and msg.group(2) else self.def_prompt
-
-        # 遍历消息链，获取第一张图片（Sora网页端点不支持多张图片的视频生成，至少测试的时候是这样）
-        image_url = ""
-        for comp in event.get_messages():
-            if isinstance(comp, Comp.Image) and comp.url:
-                image_url = comp.url
-                break
-            elif isinstance(comp, Comp.Reply) and comp.chain:
-                for quote in comp.chain:
-                    if isinstance(quote, Comp.Image):
-                        image_url = quote.url
-                        break
-                if image_url:
-                    break
-
-        # 下载图片
-        image_bytes = None
-        if image_url:
-            image_bytes, err = await self.utils.download_image(image_url)
-            if not image_bytes or err:
-                yield event.chain_result(
+            await event.send(
+                MessageChain(
                     [
                         Comp.Reply(id=event.message_obj.message_id),
-                        Comp.Plain(err or "❌ 下载图片失败"),
+                        Comp.Plain("❌ 请先在插件配置中添加 Token"),
                     ]
                 )
-                return
-
-        # 竖屏还是横屏
-        screen_mode = "portrait"
-        if msg and msg.group(1):
-            params = msg.group(1).strip()
-            screen_mode = "landscape" if params == "横屏" else "portrait"
-        elif self.screen_mode in ["横屏", "竖屏"]:
-            screen_mode = "landscape" if self.screen_mode == "横屏" else "portrait"
-        elif self.screen_mode == "自动" and image_bytes:
-            screen_mode = self.utils.get_image_orientation(image_bytes)
-
-        # 过滤出可用Token
-        valid_tokens = [k for k, v in self.token_dict.items() if v < self.task_limit]
-        if not valid_tokens:
-            yield event.chain_result(
-                [
-                    Comp.Reply(id=event.message_obj.message_id),
-                    Comp.Plain("❌ 当前并发数过多，请稍后再试~"),
-                ]
             )
+            return False
+        return True
+
+    async def video_schedule(
+        self,
+        event: AstrMessageEvent,
+        image_url: str | None,
+        image_bytes: bytes | None,
+        prompt: str,
+        screen_mode: str,
+    ):
+        """生成视频调度流程，负责账号轮询和Token管理"""
+        # 过滤出可用Token
+        valid_token_key = [
+            k
+            for k, v in self.token_dict.items()
+            if not v["rate_limit_reached"]
+            and v["token_state"] == 1
+            and v["concurrency_count"] < self.task_limit
+        ]
+
+        if not valid_token_key:
+            yield self.build_plain_result(event, "❌ 当前无可用Token，请稍后再试~")
             return
 
-        task_id = None
-        auth_token = ""
+        task_id = ""
+        token_key = ""
         authorization = ""
-        err = None
+        err = ""
 
         # 打乱顺序，避免请求过于集中
-        random.shuffle(valid_tokens)
-        # 尝试循环使用所有可用 token
-        for auth_token in valid_tokens:
-            token = await self.get_access_token(auth_token)
-            # 若无token，则已经在获取access token时处理过错误，跳过
-            if not token:
+        random.shuffle(valid_token_key)
+        # 尝试循环使用所有可用token
+        for token_key in valid_token_key:
+            access_token = await self.get_access_token(token_key)
+            # 若无token，则已经在获取AccessToken时发生错误，跳过
+            if not access_token:
                 err = "鉴权Token无效或已过期，请检查后重新配置~"
                 continue
-            authorization = "Bearer " + token
+            authorization = "Bearer " + access_token
             # 调用创建视频的函数
             task_id, err = await self.create_video(
                 event,
@@ -430,14 +358,15 @@ class VideoSora(Star):
                 prompt,
                 screen_mode,
                 authorization,
-                auth_token,
+                token_key,
             )
-            # 未免麻烦，仅在每次请求时第一次使用 access token 的时候处理access token 无效的问题
+            # 仅在第一次使用 AccessToken 的时候处理 AccessToken 无效的问题
             if self.token_type == "session_token" and err == "token_expired":
-                access_token = await self.refresh_auth_token(auth_token)
+                access_token = await self.refresh_auth_token(token_key)
                 if not access_token:
-                    err = "鉴权Token无效或已过期，请检查后重新配置~"
+                    err = "鉴权无效或已过期，请检查后重新配置~"
                     continue
+                authorization = "Bearer " + access_token
                 # 重新调用一次
                 task_id, err = await self.create_video(
                     event,
@@ -445,76 +374,81 @@ class VideoSora(Star):
                     image_bytes,
                     prompt,
                     screen_mode,
-                    "Bearer " + access_token,
-                    auth_token,
+                    authorization,
+                    token_key,
                 )
             # 如果成功拿到 task_id，则跳出循环
             if task_id:
-                # 释放内存
-                image_bytes = None
                 # 回复用户
-                yield event.chain_result(
-                    [
-                        Comp.Reply(id=event.message_obj.message_id),
-                        Comp.Plain(f"🎬 正在生成视频，请稍候~\nID: {task_id}"),
-                    ]
+                yield self.build_plain_result(
+                    event, f"🎬 正在生成视频，请稍候~\nID: {task_id}"
                 )
                 break
 
         # 尝试完所有 token 仍然请求失败
         if not task_id:
-            yield event.chain_result(
-                [
-                    Comp.Reply(id=event.message_obj.message_id),
-                    Comp.Plain(err or "❌ 创建视频任务失败，请稍后再试~"),
-                ]
+            yield self.build_plain_result(
+                event, err or "❌ 创建视频任务失败，请稍后再试~"
             )
             return
 
         try:
             # 记录并发
-            if self.token_dict[auth_token] >= self.task_limit:
-                self.token_dict[auth_token] = self.task_limit
-                logger.warning(f"Token {auth_token[-4:]} 并发数已达上限，但仍尝试使用")
-            else:
-                self.token_dict[auth_token] += 1
+            await self.concurrence_lock(token_key, is_add=True)
             # 交给queue_task处理，直到返回视频链接或者错误信息
             video_url, err_msg = await self.queue_task(event, task_id, authorization)
             if not video_url:
-                yield event.chain_result(
-                    [
-                        Comp.Reply(id=event.message_obj.message_id),
-                        Comp.Plain(err_msg or "❌ 查询视频生成状态失败"),
-                    ]
+                yield self.build_plain_result(
+                    event, err_msg or "❌ 查询视频生成状态失败"
                 )
                 return
 
             # 视频组件
-            video_comp, err_msg = await self.handle_video_comp(task_id, video_url)
+            video_chain, err_msg = await self.handle_video_chain(
+                event, task_id, video_url
+            )
             if err_msg:
-                yield event.chain_result(
-                    [
-                        Comp.Reply(id=event.message_obj.message_id),
-                        Comp.Plain(err_msg or "❌ 查询视频生成状态失败"),
-                    ]
-                )
+                yield self.build_plain_result(event, err_msg or "❌ 处理视频消息失败")
                 return
 
             # 发送视频
-            if video_comp:
-                yield event.chain_result([video_comp])
-                # 删除视频文件，如果没有开启保存视频功能，那么只有在开启self.proxy以后才有可能下载视频
-                if not self.save_video_enabled and self.proxy:
-                    self.utils.delete_video(task_id)
-
+            yield video_chain
+            # 删除视频文件，如果没有开启保存视频功能，那么只有在开启self.proxy以后才有可能下载视频
+            if not self.save_video_enabled and self.proxy:
+                self.SoraAPI.delete_video(task_id)
         finally:
-            if self.token_dict[auth_token] <= 0:
-                self.token_dict[auth_token] = 0
-                logger.warning(f"Token {auth_token[-4:]} 并发数计算错误，已重置为0")
-            else:
-                self.token_dict[auth_token] -= 1
-            # 确保发送完成后再释放并发计数，防止下载视频或者发送视频过程中查询导致重复发送
+            await self.concurrence_lock(token_key, is_add=False)
             self.polling_task.remove(task_id)
+
+    @filter.command("sora", alias={"生成视频"})
+    async def video_sora(self, event: AstrMessageEvent):
+        """使用Sora生成视频消息入口，处理用户消息"""
+        # 检查权限
+        if not await self.check_permission(event):
+            return
+
+        # 尝试获取图片
+        image_url = get_image(event)
+        image_bytes = None
+        if image_url:
+            image_bytes, err = await self.SoraAPI.download_image(image_url)
+            if err:
+                yield self.build_plain_result(event, err)
+                return
+
+        # 解析提示词和横竖屏设置
+        prompt, screen_mode = get_screen_mode(
+            event.message_str,
+            self.def_prompt,
+            self.screen_mode,
+            image_bytes,
+        )
+
+        # 进入生成视频调度流程
+        async for result in self.video_schedule(
+            event, image_url, image_bytes, prompt, screen_mode
+        ):
+            yield result
 
     @filter.command("sora查询", alias={"sora强制查询"})
     async def check_video_task(self, event: AstrMessageEvent, task_id: str):
@@ -523,17 +457,10 @@ class VideoSora(Star):
         强制查询将绕过数据库缓存，调用接口重新查询任务情况
         """
         # 检查群是否在白名单中
-        if (
-            self.group_whitelist_enabled
-            and event.unified_msg_origin not in self.group_whitelist
-        ):
-            logger.warning("当前群不在白名单中，无法使用 sora查询 功能")
+        if not await self.check_permission(event):
             return
-        self.cursor.execute(
-            "SELECT status, video_url, error_msg, auth_xor FROM video_data WHERE task_id = ?",
-            (task_id,),
-        )
-        row = self.cursor.fetchone()
+        # 从数据库中获取任务信息
+        row = self.database.load_video_data(task_id)
         if not row:
             yield event.chain_result(
                 [
@@ -556,77 +483,54 @@ class VideoSora(Star):
                 return
             # 有视频，直接发送视频
             if video_url:
-                video_comp, err_msg = await self.handle_video_comp(task_id, video_url)
+                video_comp, err_msg = await self.handle_video_chain(
+                    event, task_id, video_url
+                )
                 if err_msg:
-                    yield event.chain_result(
-                        [
-                            Comp.Reply(id=event.message_obj.message_id),
-                            Comp.Plain(err_msg or "❌ 查询视频生成状态失败"),
-                        ]
-                    )
+                    yield self.build_plain_result(event, err_msg)
                     return
-                if video_comp:
-                    yield event.chain_result([video_comp])
-                    # 删除视频文件
-                    if not self.save_video_enabled and self.proxy:
-                        self.utils.delete_video(task_id)
-                    return
+                yield video_comp
+                # 删除视频文件
+                if not self.save_video_enabled and self.proxy:
+                    self.SoraAPI.delete_video(task_id)
+                return
         # 再次尝试完成视频生成
         # 尝试匹配auth_token
-        auth_token = None
-        for token in self.token_dict.keys():
-            if token.endswith(auth_xor):
-                auth_token = token
+        token_key = None
+        for key in self.token_key_list:
+            if key == auth_xor:
+                token_key = key
                 break
-        if not auth_token:
-            yield event.chain_result(
-                [
-                    Comp.Reply(id=event.message_obj.message_id),
-                    Comp.Plain("❌ Token不存在，无法查询视频生成状态"),
-                ]
-            )
+        if not token_key:
+            yield self.build_plain_result(event, "❌ Token不存在，无法查询视频生成状态")
             return
         # 交给queue_task处理，直到返回视频链接或者错误信息
-        token = await self.get_access_token(auth_token)
+        access_token = await self.get_access_token(token_key)
         # 若无token，则已经在获取access token时处理过错误，跳过
-        if not token:
-            yield event.chain_result(
-                [
-                    Comp.Reply(id=event.message_obj.message_id),
-                    Comp.Plain("❌ 鉴权Token无效或已过期，请检查后重新配置~"),
-                ]
+        if not access_token:
+            yield self.build_plain_result(
+                event, "❌ 鉴权无效或已过期，请检查后重新配置~"
             )
             return
-        authorization = "Bearer " + token
+        authorization = "Bearer " + access_token
         video_url, msg = await self.queue_task(
             event, task_id, authorization, is_check=True
         )
         if not video_url:
-            yield event.chain_result(
-                [
-                    Comp.Reply(id=event.message_obj.message_id),
-                    Comp.Plain(msg or "❌ 查询视频生成状态失败"),
-                ]
-            )
+            yield self.build_plain_result(event, msg or "❌ 查询视频生成状态失败")
             return
 
         # 视频组件
-        video_comp, err_msg = await self.handle_video_comp(task_id, video_url)
+        video_chain, err_msg = await self.handle_video_chain(event, task_id, video_url)
         if err_msg:
-            yield event.chain_result(
-                [
-                    Comp.Reply(id=event.message_obj.message_id),
-                    Comp.Plain(err_msg or "❌ 查询视频生成状态失败"),
-                ]
-            )
+            yield self.build_plain_result(event, err_msg)
             return
 
         # 发送处理后的视频
-        if video_comp:
-            yield event.chain_result([video_comp])
-            # 删除视频文件
-            if not self.save_video_enabled and self.proxy:
-                self.utils.delete_video(task_id)
+        yield video_chain
+        # 删除视频文件
+        if not self.save_video_enabled and self.proxy:
+            self.SoraAPI.delete_video(task_id)
 
     @filter.permission_type(filter.PermissionType.ADMIN)
     @filter.command("sora鉴权检测")
@@ -639,84 +543,115 @@ class VideoSora(Star):
             ]
         )
         result = "✅ 有效  ❌ 无效  ⌛ 超时  ❓ 错误\n"
-        for auth_token in self.token_dict.keys():
-            authorization = "Bearer " + auth_token
-            is_valid = await self.utils.check_token_validity(authorization)
+        for token_key in self.token_key_list:
+            access_token = await self.get_access_token(token_key)
+            if not access_token:
+                result += f"❌ {token_key}\n"
+                continue
+            authorization = "Bearer " + access_token
+            is_valid = await self.SoraAPI.check_token_validity(authorization)
             if is_valid == "Success":
-                result += f"✅ {auth_token[-16:]}\n"
+                result += f"✅ {token_key}\n"
             elif is_valid == "Invalid":
-                result += f"❌ {auth_token[-16:]}\n"
+                result += f"❌ {token_key}\n"
             elif is_valid == "Timeout":
-                result += f"⌛ {auth_token[-16:]}\n"
+                result += f"⌛ {token_key}\n"
             elif is_valid == "EXCEPTION":
-                result += f"❓ {auth_token[-16:]}\n"
-        yield event.chain_result(
-            [
-                Comp.Reply(id=event.message_obj.message_id),
-                Comp.Plain(result),
-            ]
-        )
+                result += f"❓ {token_key}\n"
+        yield self.build_plain_result(event, result)
 
-    async def refresh_auth_token(self, session_token_xor: str) -> str | None:
+    async def refresh_auth_token(self, token_key: str) -> str | None:
         """刷新鉴权Token的可用状态"""
         if self.token_type != "SessionToken":
             return None
 
         # 获取完整的SessionToken
-        session_token = self.session_token_dict.get(session_token_xor, "")
+        session_token = self.token_dict.get(token_key, {}).get("session_token", None)
+        if not session_token:
+            logger.error(f"{token_key} 无法刷新 AccessToken，缺少 SessionToken")
+            return None
         (
             new_access_token,
             session_token_expire,
-            _,
-        ) = await self.utils.refresh_access_token(session_token)
-        if new_access_token:
+            err,
+        ) = await self.SoraAPI.refresh_access_token(session_token)
+        if err:
+            self.database.update_session_token_state(token_key, self.token_type)
+            logger.error(f"{token_key} 的 AccessToken 刷新失败")
+        if new_access_token and session_token_expire:
             # 更新内存中的AccessToken
-            self.access_token_dict[session_token_xor] = new_access_token
+            self.token_dict[token_key]["access_token"] = new_access_token
             # 更新数据库中的AccessToken
-            self.cursor.execute(
-                """
-                UPDATE session_token_table SET access_token = ?, session_token_expire = ?, session_token_state = ? WHERE session_token_xor = ?
-            """,
-                (
-                    new_access_token,
-                    session_token_expire,
-                    1,
-                    session_token_xor,
-                ),
+            self.database.update_access_token_data(
+                token_key, self.token_type, new_access_token, session_token_expire
             )
-            self.conn.commit()
-            logger.info(f"{session_token_xor} 的 AccessToken 已刷新")
-        else:
-            self.cursor.execute(
-                """
-                UPDATE session_token_table SET session_token_state = ? WHERE session_token_xor = ?
-            """,
-                (
-                    0,
-                    session_token_xor,
-                ),
-            )
-            self.conn.commit()
-            logger.error(f"{session_token_xor} 的 AccessToken 刷新失败")
-            self.token_err_set.add(session_token_xor)
+            logger.info(f"{token_key} 的 AccessToken 已刷新")
+
         return new_access_token
 
-    async def get_access_token(self, token: str) -> str | None:
+    async def get_access_token(self, token_key: str) -> str | None:
         """获取对应SessionToken的AccessToken"""
-        if self.token_type != "SessionToken":
-            return token
-        access_token = self.access_token_dict.get(token, "")
+        access_token = self.token_dict.get(token_key, {}).get("access_token", None)
         if access_token:
             return access_token
-        # 尝试刷新AccessToken，这里的token是后16位
-        return await self.refresh_auth_token(token)
+        if self.token_type == "SessionToken":
+            return await self.refresh_auth_token(token_key)
+
+    def build_plain_result(
+        self, event: AstrMessageEvent, message: str
+    ) -> MessageEventResult:
+        return event.chain_result(
+            [
+                Comp.Reply(id=event.message_obj.message_id),
+                Comp.Plain(message),
+            ]
+        )
+
+    @filter.llm_tool(name="sora_video_generation")
+    async def sora_tool(self, event: AstrMessageEvent, prompt: str, screen: str):
+        """
+        A video generation tool, supporting both text-to-video and image-to-video functionalities.
+        If the user requests image-to-video generation, you must first verify that the user's
+        current message explicitly contains an actual image. References like 'this one' or 'the
+        above image' that point to an image in text form are not acceptable. Proceed only if a
+        real image is present.
+
+        Args:
+            prompt(string): The video generation prompt. Refine the video generation prompt to
+                ensure it is clear, detailed, and accurately aligned with the user's intent.
+            screen(string): The screen orientation for the video. Must be one of "landscape" or
+                "portrait". You may choose a suitable orientation if the user does not specify.
+        """
+
+        # 检查权限
+        if not await self.check_permission(event):
+            return
+
+        # 尝试获取图片
+        image_url = get_image(event)
+        image_bytes = None
+        if image_url:
+            image_bytes, err = await self.SoraAPI.download_image(image_url)
+            if err:
+                return self.build_plain_result(event, err)
+
+        # 使用提供的参数或默认参数
+        if not prompt:
+            prompt = self.def_prompt
+        if not screen:
+            screen = self.screen_mode
+
+        # 调用视频生成调度流程
+        async for result in self.video_schedule(
+            event, image_url, image_bytes, prompt, screen
+        ):
+            if result:
+                await event.send(result)
 
     async def terminate(self):
         """可选择实现异步的插件销毁方法，当插件被卸载/停用时会调用。"""
         try:
-            await self.utils.close()
-            self.conn.commit()
-            self.cursor.close()
-            self.conn.close()
+            await self.SoraAPI.close()
+            self.database.close()
         except Exception as e:
             logger.error(f"插件卸载时发生错误: {e}")
